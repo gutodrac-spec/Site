@@ -1,0 +1,24 @@
+name: Mapa via ngrok
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Minutos que o mapa fica no ar (máx. ~350)"
+        default: "60"
+
+jobs:
+  mapa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Rodar mapa e abrir túnel ngrok (veja a URL no log)
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+          RUN_MINUTES: ${{ github.event.inputs.minutes }}
+        run: python run_ngrok.py
