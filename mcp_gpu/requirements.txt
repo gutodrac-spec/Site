@@ -1,0 +1,7 @@
+mcp>=1.10,<2
+pyngrok
+diffusers>=0.30
+transformers
+accelerate
+sentencepiece
+torch
