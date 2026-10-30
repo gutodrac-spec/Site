@@ -23,6 +23,10 @@ os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 PASTA_SAIDA = os.environ.get("PASTA_SAIDA", "saidas")
 MAX_MODELOS = int(os.environ.get("MAX_MODELOS", "2"))
 COMPILAR = os.environ.get("COMPILAR", "0") == "1"
+# Limiar do cache entre passos nos modelos de vídeo (0 desliga; maior = mais rápido, menos fiel).
+CACHE_VIDEO = float(os.environ.get("CACHE_VIDEO", "0.05"))
+# LoRA de destilação para vídeo (ex.: CausVid), permite 4-8 passos com guidance 1.
+LORA_VIDEO = os.environ.get("LORA_VIDEO", "")
 
 PADROES = {
     "texto": os.environ.get("MODELO_TEXTO", "Qwen/Qwen2.5-1.5B-Instruct"),
@@ -159,17 +163,45 @@ def _carregar_imagem(repo_id):
     return pipe
 
 
-def _carregar_video(repo_id):
+def _carregar_lora(pipe, lora):
+    """lora: "dono/repo" ou "dono/repo:arquivo.safetensors". Funde nos pesos (sem custo extra)."""
+    repo, _, arquivo = lora.partition(":")
+    pipe.load_lora_weights(repo, weight_name=arquivo or None, adapter_name="rapido")
+    pipe.fuse_lora()
+    pipe.unload_lora_weights()
+
+
+def _carregar_video(repo_id, lora=None):
     from diffusers import DiffusionPipeline
 
-    pipe = DiffusionPipeline.from_pretrained(repo_id, torch_dtype=_dtype())
-    if _dispositivo() == "cuda" and _vram_gb() < 20:
-        pipe.enable_model_cpu_offload()
-    else:
+    torch = _torch()
+    kwargs = {"torch_dtype": _dtype()}
+    if "wan" in repo_id.lower():
+        # O VAE do Wan precisa de fp32 para não gerar vídeo preto; é pequeno, quase não pesa.
+        from diffusers import AutoencoderKLWan
+
+        kwargs["vae"] = AutoencoderKLWan.from_pretrained(repo_id, subfolder="vae",
+                                                         torch_dtype=torch.float32)
+    pipe = DiffusionPipeline.from_pretrained(repo_id, **kwargs)
+    if lora:
+        _carregar_lora(pipe, lora)
+    # Tudo na GPU é muito mais rápido; offload para a CPU só se realmente não couber.
+    try:
         pipe.to(_dispositivo())
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        pipe.enable_model_cpu_offload()
     pipe.set_progress_bar_config(disable=True)
     if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
         pipe.vae.enable_tiling()
+    if CACHE_VIDEO > 0 and hasattr(pipe, "transformer"):
+        # Reaproveita cálculos entre passos parecidos: ~1,5-2x mais rápido, perda pequena.
+        try:
+            from diffusers import FirstBlockCacheConfig
+
+            pipe.transformer.enable_cache(FirstBlockCacheConfig(threshold=CACHE_VIDEO))
+        except Exception as e:
+            print(f"Cache de vídeo indisponível nesta versão do diffusers: {e}")
     return pipe
 
 
@@ -184,7 +216,8 @@ def _carregar_pipeline(repo_id, tarefa):
     )
 
 
-def carregar(repo_id: str | None = None, tipo: str = "texto", quantizar_4bit: bool = False) -> str:
+def carregar(repo_id: str | None = None, tipo: str = "texto", quantizar_4bit: bool = False,
+             lora: str | None = None) -> str:
     repo_id = repo_id or PADROES.get(tipo)
     if not repo_id:
         raise ValueError(f"Informe o repo_id para o tipo '{tipo}'.")
@@ -199,7 +232,7 @@ def carregar(repo_id: str | None = None, tipo: str = "texto", quantizar_4bit: bo
         elif tipo == "imagem":
             obj = _carregar_imagem(repo_id)
         elif tipo == "video":
-            obj = _carregar_video(repo_id)
+            obj = _carregar_video(repo_id, lora or LORA_VIDEO or None)
         else:
             obj = _carregar_pipeline(repo_id, TAREFAS_PIPELINE.get(tipo, tipo))
         _modelos[repo_id] = {"tipo": tipo, "obj": obj}
@@ -269,13 +302,30 @@ def gerar_imagem(prompt: str, passos: int = 2, guidance: float = 0.0, largura: i
     return buf.getvalue()
 
 
-def gerar_video(prompt: str, quadros: int = 33, passos: int = 20, guidance: float = 5.0,
-                largura: int = 832, altura: int = 480, fps: int = 16, seed: int = -1,
-                modelo: str | None = None) -> str:
-    """Gera um MP4 e devolve o nome do arquivo salvo em PASTA_SAIDA."""
+PRESETS_VIDEO = {
+    # quadros, passos, guidance, largura, altura
+    "rapido": (17, 12, 5.0, 640, 368),
+    "normal": (33, 20, 5.0, 832, 480),
+    "qualidade": (81, 30, 5.0, 832, 480),
+    "lora": (33, 6, 1.0, 832, 480),  # com LoRA de destilação (CausVid)
+}
+
+
+def gerar_video(prompt: str, quadros: int | None = None, passos: int | None = None,
+                guidance: float | None = None, largura: int | None = None,
+                altura: int | None = None, fps: int = 16, seed: int = -1,
+                modelo: str | None = None, preset: str = "") -> str:
+    """Gera um MP4 e devolve o nome do arquivo salvo em PASTA_SAIDA.
+
+    preset: rapido | normal | qualidade | lora. Valores informados sobrescrevem o preset.
+    """
     from diffusers.utils import export_to_video
 
     torch = _torch()
+    preset = preset or ("lora" if LORA_VIDEO else "normal")
+    q, p, g, lw, lh = PRESETS_VIDEO.get(preset, PRESETS_VIDEO["normal"])
+    quadros, passos, guidance = quadros or q, passos or p, g if guidance is None else guidance
+    largura, altura = largura or lw, altura or lh
     pipe = _obter("video", modelo)
     opcoes = {"prompt": prompt, "num_frames": quadros, "num_inference_steps": passos,
               "guidance_scale": guidance, "width": largura, "height": altura}

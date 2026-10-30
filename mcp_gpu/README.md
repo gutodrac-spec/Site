@@ -31,7 +31,7 @@ Ao iniciar, o servidor imprime (com `{base}` = URL do ngrok + token):
 | `POST /api/descarregar` | `{"repo_id": "..."}` | mensagem |
 | `POST /api/texto` | `{"prompt": "...", "sistema": "", "max_tokens": 512, "temperatura": 0.7}` ou `{"mensagens": [...]}` | `{"texto": ...}` |
 | `POST /api/imagem` | `{"prompt": "...", "passos": 2, "largura": 768, "altura": 768, "formato": "json"}` | JPEG (ou base64) |
-| `POST /api/video` | `{"prompt": "...", "quadros": 33, "passos": 20}` | `{"url": ...mp4}` |
+| `POST /api/video` | `{"prompt": "...", "preset": "rapido"}` (ou `quadros`, `passos`, `guidance`, `largura`, `altura`) | `{"url": ...mp4}` |
 | `POST /api/fala` | `{"texto": "..."}` | WAV |
 | `POST /api/transcrever` | `{"audio": "URL ou base64"}` ou multipart `arquivo` | `{"texto": ...}` |
 | `POST /api/pipeline` | `{"tarefa": "translation", "repo_id": "Helsinki-NLP/opus-mt-en-pt", "entrada": "Hello"}` | `{"resultado": ...}` |
@@ -59,7 +59,22 @@ Em `model`, use `default` ou um repo do Hugging Face (`dono/nome`).
 - `COMPILAR=1` ativa `torch.compile` nos modelos de imagem (primeira geração mais lenta, as seguintes ~1,5-2x mais rápidas).
 - Gerações rodam em thread separada e uma por vez na GPU, evitando falta de memória.
 
+## Vídeo mais rápido
+1. **Presets:** `"preset": "rapido"` (17 quadros, 12 passos, 640x368) é ~4-6x mais rápido que `normal`.
+2. **Tudo na GPU:** o Wan 1.3B cabe inteiro numa T4; só usa offload se faltar memória.
+3. **Cache entre passos** (`CACHE_VIDEO=0.05`): reaproveita cálculos, ~1,5-2x mais rápido. `0` desliga; valores maiores aceleram mais e perdem detalhe.
+4. **LoRA de destilação (CausVid):** permite 4-8 passos com guidance 1 (sem CFG), ~3-5x mais rápido:
+   ```python
+   # na API: POST /api/carregar
+   {"tipo": "video", "lora": "Kijai/WanVideo_comfy:Wan21_CausVid_bidirect2_T2V_1_3B_lora_rank32.safetensors"}
+   # e depois gere com "preset": "lora"
+   ```
+   Ou defina `LORA_VIDEO` antes de iniciar. Confira o nome exato do arquivo no repositório da LoRA.
+5. **Modelo destilado alternativo:** `"modelo": "Lightricks/LTX-Video-0.9.7-distilled"` com `"passos": 8, "guidance": 1.0` (quadros = múltiplo de 8 + 1; largura/altura múltiplos de 32). Confira a licença.
+6. **GPU melhor:** uma L4 ou A100 (RunPod, Modal) costuma ser 3-10x mais rápida que a T4.
+
 ## Variáveis de ambiente
+`CACHE_VIDEO` (0.05), `LORA_VIDEO`,
 `NGROK_AUTHTOKEN`, `MCP_TOKEN` (gerado se vazio), `MCP_PORTA` (8000), `PRE_CARREGAR` (ex.: `texto,imagem`), `MAX_MODELOS` (2), `COMPILAR` (0), `PASTA_SAIDA` (`saidas`), `MODELO_TEXTO`, `MODELO_IMAGEM`, `MODELO_VIDEO`, `MODELO_FALA`, `MODELO_TRANSCRICAO`.
 
 ## Rodar fora do Colab

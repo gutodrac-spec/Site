@@ -49,14 +49,16 @@ async def _rodar(funcao, *args, **kwargs):
 # ======================================================================= MCP
 
 @mcp.tool()
-async def carregar_modelo(repo_id: str = "", tipo: str = "texto", quantizar_4bit: bool = False) -> str:
+async def carregar_modelo(repo_id: str = "", tipo: str = "texto", quantizar_4bit: bool = False,
+                          lora: str = "") -> str:
     """Baixa e carrega um modelo do Hugging Face na GPU.
 
     tipo: texto | imagem | video | fala | transcrever | qualquer tarefa do transformers.pipeline
     (ex.: translation, summarization, image-classification). repo_id vazio usa o modelo padrão do tipo.
     quantizar_4bit=True permite LLMs maiores (ex.: 7B-8B numa T4).
+    lora (vídeo): "dono/repo" ou "dono/repo:arquivo.safetensors" de uma LoRA de destilação.
     """
-    return await _rodar(motor.carregar, repo_id or None, tipo, quantizar_4bit)
+    return await _rodar(motor.carregar, repo_id or None, tipo, quantizar_4bit, lora or None)
 
 
 @mcp.tool()
@@ -87,12 +89,17 @@ async def gerar_imagem(prompt: str, passos: int = 2, guidance: float = 0.0, larg
 
 
 @mcp.tool()
-async def gerar_video(prompt: str, quadros: int = 33, passos: int = 20, guidance: float = 5.0,
-                      largura: int = 832, altura: int = 480, seed: int = -1,
+async def gerar_video(prompt: str, preset: str = "", quadros: int = 0, passos: int = 0,
+                      guidance: float = -1, largura: int = 0, altura: int = 0, seed: int = -1,
                       modelo: str = "") -> str:
-    """Gera um vídeo curto (padrão Wan2.1 1.3B) e devolve o link do MP4. Pode levar alguns minutos."""
-    nome = await _rodar(motor.gerar_video, prompt, quadros, passos, guidance, largura, altura,
-                        seed=seed, modelo=modelo or None)
+    """Gera um vídeo curto (padrão Wan2.1 1.3B) e devolve o link do MP4.
+
+    preset: rapido (17 quadros, 12 passos, 640x368) | normal | qualidade | lora (6 passos, com LoRA).
+    Valores 0/-1 usam os do preset.
+    """
+    nome = await _rodar(motor.gerar_video, prompt, quadros or None, passos or None,
+                        None if guidance < 0 else guidance, largura or None, altura or None,
+                        seed=seed, modelo=modelo or None, preset=preset)
     return _url_arquivo(nome)
 
 
@@ -152,7 +159,7 @@ async def api_carregar(request: Request):
     c = await _corpo(request)
     try:
         msg = await _rodar(motor.carregar, c.get("repo_id"), c.get("tipo", "texto"),
-                           c.get("quantizar_4bit", False))
+                           c.get("quantizar_4bit", False), c.get("lora"))
         return JSONResponse({"mensagem": msg})
     except Exception as e:
         return _erro(e)
@@ -199,10 +206,10 @@ async def api_imagem(request: Request):
 async def api_video(request: Request):
     c = await _corpo(request)
     try:
-        nome = await _rodar(motor.gerar_video, c["prompt"], c.get("quadros", 33),
-                            c.get("passos", 20), c.get("guidance", 5.0), c.get("largura", 832),
-                            c.get("altura", 480), c.get("fps", 16), c.get("seed", -1),
-                            c.get("modelo"))
+        nome = await _rodar(motor.gerar_video, c["prompt"], c.get("quadros"), c.get("passos"),
+                            c.get("guidance"), c.get("largura"), c.get("altura"),
+                            c.get("fps", 16), c.get("seed", -1), c.get("modelo"),
+                            c.get("preset", ""))
         return JSONResponse({"url": _url_arquivo(nome)})
     except Exception as e:
         return _erro(e)
