@@ -20,8 +20,11 @@ from starlette.responses import FileResponse, JSONResponse, Response
 
 import motor
 
+# Defina MCP_TOKEN e NGROK_DOMINIO (domínio fixo grátis do ngrok) para a URL do conector
+# continuar a mesma quando o Colab reiniciar.
 TOKEN = os.environ.get("MCP_TOKEN") or secrets.token_urlsafe(24)
 PORTA = int(os.environ.get("MCP_PORTA", "8000"))
+NGROK_DOMINIO = os.environ.get("NGROK_DOMINIO", "")
 BASE = f"/{TOKEN}"
 
 mcp = FastMCP(
@@ -57,7 +60,12 @@ async def carregar_modelo(repo_id: str = "", tipo: str = "texto", quantizar_4bit
     (ex.: translation, summarization, image-classification). repo_id vazio usa o modelo padrão do tipo.
     quantizar_4bit=True permite LLMs maiores (ex.: 7B-8B numa T4).
     lora (vídeo): "dono/repo" ou "dono/repo:arquivo.safetensors" de uma LoRA de destilação.
+    Vídeo carrega em segundo plano e devolve um id para consultar_tarefa.
     """
+    if tipo == "video":
+        tarefa_id = motor.em_segundo_plano(motor.carregar, repo_id or None, tipo, quantizar_4bit,
+                                           lora or None)
+        return f"Carregando em segundo plano. id da tarefa: {tarefa_id}. Consulte com consultar_tarefa."
     return await _rodar(motor.carregar, repo_id or None, tipo, quantizar_4bit, lora or None)
 
 
@@ -92,15 +100,30 @@ async def gerar_imagem(prompt: str, passos: int = 2, guidance: float = 0.0, larg
 async def gerar_video(prompt: str, preset: str = "", quadros: int = 0, passos: int = 0,
                       guidance: float = -1, largura: int = 0, altura: int = 0, seed: int = -1,
                       modelo: str = "") -> str:
-    """Gera um vídeo curto (padrão Wan2.1 1.3B) e devolve o link do MP4.
+    """Começa a gerar um vídeo curto (padrão Wan2.1 1.3B) em segundo plano e devolve um id.
 
+    Vídeo leva minutos: depois chame consultar_tarefa(id) até o estado ser "pronto"; o resultado
+    é o link do MP4. Na primeira vez o modelo também é baixado e carregado.
     preset: rapido (17 quadros, 12 passos, 640x368) | normal | qualidade | lora (6 passos, com LoRA).
     Valores 0/-1 usam os do preset.
     """
-    nome = await _rodar(motor.gerar_video, prompt, quadros or None, passos or None,
-                        None if guidance < 0 else guidance, largura or None, altura or None,
-                        seed=seed, modelo=modelo or None, preset=preset)
-    return _url_arquivo(nome)
+    def tarefa():
+        nome = motor.gerar_video(prompt, quadros or None, passos or None,
+                                 None if guidance < 0 else guidance, largura or None,
+                                 altura or None, seed=seed, modelo=modelo or None, preset=preset)
+        return _url_arquivo(nome)
+
+    tarefa_id = motor.em_segundo_plano(tarefa)
+    return f"Vídeo em geração. id da tarefa: {tarefa_id}. Consulte com consultar_tarefa."
+
+
+@mcp.tool()
+async def consultar_tarefa(tarefa_id: str) -> dict:
+    """Consulta uma tarefa em segundo plano (vídeo ou carregamento de modelo).
+
+    estado: rodando | pronto | erro. Se ainda estiver rodando, espere ~30-60 s e consulte de novo.
+    """
+    return motor.consultar(tarefa_id)
 
 
 @mcp.tool()
@@ -213,6 +236,11 @@ async def api_video(request: Request):
         return JSONResponse({"url": _url_arquivo(nome)})
     except Exception as e:
         return _erro(e)
+
+
+@_rota("/api/tarefa/{tarefa_id}", ("GET",))
+async def api_tarefa(request: Request):
+    return JSONResponse(motor.consultar(request.path_params["tarefa_id"]))
 
 
 @_rota("/api/fala")
@@ -340,10 +368,14 @@ def iniciar(ngrok_token: str | None = None, pre_carregar: list[str] | None = Non
 
     threading.Thread(target=lambda: mcp.run(transport="streamable-http"), daemon=True).start()
     if ngrok_token:
-        from pyngrok import ngrok
+        from pyngrok import conf, ngrok
 
-        ngrok.set_auth_token(ngrok_token)
-        estado["url_publica"] = ngrok.connect(PORTA, "http").public_url
+        # Passa o token direto na configuração: set_auth_token falha nas versões novas do
+        # ngrok quando o token já foi salvo numa execução anterior.
+        conf.get_default().auth_token = ngrok_token
+        ngrok.kill()  # fecha túneis de uma execução anterior desta sessão
+        opcoes = {"domain": NGROK_DOMINIO} if NGROK_DOMINIO else {}
+        estado["url_publica"] = ngrok.connect(PORTA, "http", **opcoes).public_url
     for tipo in pre_carregar or []:
         print(motor.carregar(None, tipo))
     base = f"{estado['url_publica']}{BASE}"

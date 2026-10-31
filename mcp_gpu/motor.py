@@ -182,12 +182,28 @@ def _carregar_video(repo_id, lora=None):
 
         kwargs["vae"] = AutoencoderKLWan.from_pretrained(repo_id, subfolder="vae",
                                                          torch_dtype=torch.float32)
+        if _dispositivo() == "cuda" and _vram_gb() < 24:
+            # O codificador de texto (umt5-xxl, ~11 GB) estoura a RAM do Colab e não cabe com o
+            # resto numa T4. Em 8 bits ele cai para ~6 GB e é carregado direto na GPU.
+            try:
+                from diffusers.quantizers import PipelineQuantizationConfig
+
+                kwargs["quantization_config"] = PipelineQuantizationConfig(
+                    quant_backend="bitsandbytes_8bit",
+                    quant_kwargs={"load_in_8bit": True},
+                    components_to_quantize=["text_encoder"],
+                )
+            except ImportError:
+                print("diffusers sem PipelineQuantizationConfig; atualize para >=0.33.")
     pipe = DiffusionPipeline.from_pretrained(repo_id, **kwargs)
     if lora:
         _carregar_lora(pipe, lora)
     # Tudo na GPU é muito mais rápido; offload para a CPU só se realmente não couber.
     try:
-        pipe.to(_dispositivo())
+        for nome, componente in pipe.components.items():
+            # Componentes quantizados já estão na GPU e não podem ser movidos.
+            if hasattr(componente, "to") and not getattr(componente, "is_loaded_in_8bit", False):
+                componente.to(_dispositivo())
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
         pipe.enable_model_cpu_offload()
@@ -225,7 +241,10 @@ def carregar(repo_id: str | None = None, tipo: str = "texto", quantizar_4bit: bo
         if repo_id in _modelos:
             _modelos.move_to_end(repo_id)
             return f"{repo_id} já estava carregado ({tipo})."
-        while len(_modelos) >= MAX_MODELOS:
+        limite = MAX_MODELOS
+        if tipo == "video" and _dispositivo() == "cuda" and _vram_gb() < 24:
+            limite = 1  # vídeo precisa da GPU inteira numa T4/L4
+        while _modelos and len(_modelos) >= limite:
             _liberar(next(iter(_modelos)))
         if tipo == "texto":
             obj = _carregar_texto(repo_id, quantizar_4bit)
@@ -360,6 +379,36 @@ def transcrever(audio: str, idioma: str | None = None, modelo: str | None = None
         opcoes["generate_kwargs"] = {"language": idioma}
     with _trava, _torch().inference_mode():
         return pipe(_ler_audio(audio), **opcoes)["text"].strip()
+
+
+_tarefas = {}  # id -> {"estado": "rodando" | "pronto" | "erro", "resultado": ..., "inicio": ...}
+
+
+def em_segundo_plano(funcao, *args, **kwargs) -> str:
+    """Roda uma função demorada numa thread e devolve o id para consultar depois."""
+    import time
+
+    tarefa_id = uuid.uuid4().hex[:12]
+    _tarefas[tarefa_id] = {"estado": "rodando", "resultado": None, "inicio": time.time()}
+
+    def rodar():
+        try:
+            _tarefas[tarefa_id].update(estado="pronto", resultado=funcao(*args, **kwargs))
+        except Exception as e:
+            _tarefas[tarefa_id].update(estado="erro", resultado=f"{type(e).__name__}: {e}")
+
+    threading.Thread(target=rodar, daemon=True).start()
+    return tarefa_id
+
+
+def consultar(tarefa_id: str) -> dict:
+    import time
+
+    t = _tarefas.get(tarefa_id)
+    if t is None:
+        return {"estado": "desconhecida"}
+    return {"estado": t["estado"], "resultado": t["resultado"],
+            "segundos": int(time.time() - t["inicio"])}
 
 
 def executar_pipeline(tarefa: str, repo_id: str, entrada, parametros: dict | None = None):
