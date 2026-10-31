@@ -1,0 +1,26 @@
+SITE IMÓVEIS DRACENA
+====================
+
+Arquivos
+  index.html    o site (abre o vídeo e a vitrine)
+  casa.mp4      vídeo do Veo, já convertido para rolar suave nos dois sentidos
+  imoveis.json  lista de imóveis (gerada pelo scraper)
+  scraper.py    lê o imoveisdracena.com.br e gera o imoveis.json
+
+1) Instalar uma vez (precisa de Python 3):
+     pip install requests beautifulsoup4
+
+2) Gerar os imóveis (fotos, descrição, preço, quartos, áreas):
+     python scraper.py
+
+3) Deixar atualizando sozinho a cada 5 minutos:
+     python scraper.py --loop 300
+   Deixe rodando no mesmo servidor/pasta do site. Ele só regrava o JSON
+   quando algo muda, e imóvel retirado do site some da vitrine.
+
+   Alternativa sem deixar janela aberta (Linux, cron):
+     */5 * * * * cd /caminho/do/site && python3 scraper.py
+
+4) Testar no computador:
+     python -m http.server 8000      -> abra http://localhost:8000
+   (abrir o index.html com duplo clique não carrega o JSON; precisa do servidor)
